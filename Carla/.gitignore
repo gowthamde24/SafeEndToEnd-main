@@ -1,0 +1,25 @@
+# Output and Tracking Directories
+run*_*/
+raceline_tracking_with_cbf/
+center_line_tracking/
+raceline_tracking_without_cbf/
+global_racetrajectory_opti*/
+controller_output/
+
+# Carla Client Files
+carla/
+
+# Models and Weights
+saved_models*/
+*.ckpt
+
+# Media and Plots
+Videos/
+*.mp4
+*.pdf
+*.png
+
+# Python Environments & Cache (The Large Files)
+e2e_env/
+__pycache__/
+*.so
