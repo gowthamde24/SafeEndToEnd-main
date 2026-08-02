@@ -1,8 +1,10 @@
+"""One-off script: tags ../traj_race_cl.csv racing-line points with the nearest centerline
+speed from ../racetrack_waypoints.txt, saving the result to ../racing_line.txt."""
 import numpy as np
-import math 
+import math
 
-racing_line = np.loadtxt('traj_race_cl.csv',delimiter=';')[:,[1,2,3]]
-center_line = np.loadtxt('racetrack_waypoints.txt',delimiter=',')
+racing_line = np.loadtxt('../traj_race_cl.csv',delimiter=';')[:,[1,2,3]]
+center_line = np.loadtxt('../racetrack_waypoints.txt',delimiter=',')
 
 def dist(x1,y1,x2,y2) :
     return (x1-x2)**2 + (y1-y2)**2
@@ -22,4 +24,4 @@ for row in racing_line :
     racing_line[i,2] = center_line[mint,2]
     i+=1 
 
-np.savetxt('racing_line.txt',racing_line,delimiter=',')
+np.savetxt('../racing_line.txt',racing_line,delimiter=',')

@@ -1,0 +1,3 @@
+cbf_intervention_frames,cbf_max_correction,cbf_mean_correction,lane_violation_count,max_abs_x,mean_abs_x,mode,n_frames
+17,1.0776705522375645,0.010091412199004635,0,0.9319922591582755,0.25755485879376294,with_cbf,469
+,,,0,0.5524431748856677,0.24640419451294684,without_cbf,469

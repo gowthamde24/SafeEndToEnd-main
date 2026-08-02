@@ -1,4 +1,5 @@
-INCLUDE_CBF=False
+# CBF mode is chosen per run_iter.py invocation via --cbf/--no-cbf; with neither flag
+# (as below) it defaults to the RUN_NO >= K_ITERS ramp-up behavior.
 K=3
 CURR_ITER=0
 N_ITERS=10

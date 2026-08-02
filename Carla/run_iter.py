@@ -53,7 +53,7 @@ HEIGHT = 600
 RUN_NO = 1
 N_ITERS = 4
 BETA = 0.1
-SAFEGUARD = True  # This toggles our CBF safety net on/off
+SAFEGUARD = None  # Resolved in main() from --cbf/--no-cbf, or the K_ITERS ramp-up default
 K_ITERS = 3
 VEHICLE_MODEL = 'Dynamic'
 
@@ -261,7 +261,7 @@ def get_optimal_control(steer_ref,steer_var,v,theta,theta_var,x,x_var,curvature,
         return steer_ref
     min_steer = -MAX_STEER
     min_cost = 1000000
-    steer_var = 1
+    steer_var = max(steer_var, EPSILON)  # floor near-zero MC-dropout variance so it can't blow up the tracking-cost term
     if VEHICLE_MODEL=='Kinematic' :
         for steer in np.arange(-MAX_STEER,MAX_STEER,0.01) :
             ax = 0
@@ -319,7 +319,7 @@ def get_optimal_control(steer_ref,steer_var,v,theta,theta_var,x,x_var,curvature,
                 cost += alpha*(hdd_theta_right+3*lambda_*hd_theta_right+3*lambda_**2*h_theta_right)**2
             var_left = math.sqrt((abs(lambda_**2*x_var))**2 + (v**2*math.sin(theta)*steer/L)**2 + (v**2*curvature_var)**2 + (lambda_*(v*math.cos(theta))*theta_var)**2)
             var_right = math.sqrt((abs(lambda_**2*x_var))**2 + (v**2*math.sin(theta)*steer/L)**2 + (v**2*curvature_var)**2 + (lambda_*(v*math.cos(theta))*theta_var)**2)
-            if (hddd_left + 3*lambda_*hdd_left + 3*lambda_**2*hd_left+3*lambda_**3*h_left-var_left*norm.ppf(1-BETA)) < 0 :
+            if (hddd_left + 3*lambda_*hdd_left + 3*lambda_**2*hd_left+lambda_**3*h_left-var_left*norm.ppf(1-BETA)) < 0 :
                 cost += alpha*(hddd_left + 3*lambda_*hdd_left + 3*lambda_**2*hd_left+lambda_**3*h_left-var_left*norm.ppf(1-BETA))**2
             if (hddd_right+3*lambda_*hdd_right+3*lambda_**2*hd_right+lambda_**3*h_right-var_right*norm.ppf(1-BETA)) < 0 :
                 cost += alpha*(hddd_right+3*lambda_*hdd_right+3*lambda_**2*hd_right+lambda_**3*h_right-var_right*norm.ppf(1-BETA))**2
@@ -378,14 +378,27 @@ def create_controller_output_dir(output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
+def load_checkpoint_name(model_path, suffix):
+    """suffix is '' for the steering model or '-safety-<N>' for a safety model. Prefers
+    'model-best<suffix>.ckpt' (train.py's best-val-loss checkpoint from early stopping);
+    falls back to 'model-last<suffix>.ckpt' if no val split existed for that training run
+    (e.g. a very small dataset)."""
+    if os.path.exists(os.path.join(model_path, f'model-best{suffix}.ckpt')):
+        return f'model-best{suffix}.ckpt'
+    return f'model-last{suffix}.ckpt'
+
 def store_trajectory_plot(graph, fname):
     create_controller_output_dir(CONTROLLER_OUTPUT_FOLDER)
     file_name = os.path.join(CONTROLLER_OUTPUT_FOLDER, fname)
     graph.savefig(file_name)
 
+def cbf_mode_name():
+    return 'with_cbf' if SAFEGUARD else 'without_cbf'
+
 def write_trajectory_file(x_list, y_list, v_list, t_list, steerings_list, throttle_list):
-    create_controller_output_dir(CONTROLLER_OUTPUT_FOLDER)
-    file_name = os.path.join(CONTROLLER_OUTPUT_FOLDER, 'trajectory_run'+str(RUN_NO)+'.txt')
+    output_dir = os.path.join(CONTROLLER_OUTPUT_FOLDER, cbf_mode_name())
+    create_controller_output_dir(output_dir)
+    file_name = os.path.join(output_dir, 'trajectory_run'+str(RUN_NO)+'.txt')
 
     with open(file_name, 'w') as trajectory_file: 
         for i in range(len(x_list)):
@@ -418,7 +431,9 @@ def exec_waypoint_nav_demo(args):
     spawn_points = world.get_map().get_spawn_points()
     start_pose = spawn_points[PLAYER_START_INDEX]
     ego_vehicle = world.spawn_actor(vehicle_bp, start_pose)
-    ego_vehicle.set_autopilot(True) # Engages the CARLA autopilot (used for throttle/dataset gen)
+    # Always on: throttle/brake are read from CARLA's autopilot every frame (see expert_control
+    # below) regardless of whether steering comes from autopilot (RUN_NO==0) or the NN+CBF.
+    ego_vehicle.set_autopilot(True)
     
     spectator = world.get_spectator()
     vehicle_transform = ego_vehicle.get_transform()
@@ -535,7 +550,6 @@ def exec_waypoint_nav_demo(args):
     steerings_list = [0]
     throttles_list = [0]
     
-    haha = True
     reached_the_end = False
     skip_first_frame = True
     closest_index    = 0 
@@ -578,19 +592,18 @@ def exec_waypoint_nav_demo(args):
     model_safety_3 = models.resnet18()
     model_safety_3.fc = nn.Sequential(nn.Dropout(0.2),nn.Linear(in_features, 1))
     model_safety_3 = model_safety_3.to(device)
+    model_safety_3.eval()
     model_safety_3.fc.train()
-    
-    # Loads the PyTorch weights we just trained in Phase 1
+
+    # Loads the PyTorch weights we just trained in Phase 1.
+    # Prefers the best-val-loss checkpoint (train.py's early stopping); falls back to the
+    # last-step checkpoint if no val split was available when that model was trained.
     if RUN_NO!=0 :
-        model_safety_1.load_state_dict(torch.load(os.path.join(model_path, 'model-last-safety-1.ckpt')))
-        st_dict = torch.load(os.path.join(model_path, 'model-last-safety-2.ckpt'))
-        model_safety_2.load_state_dict(st_dict)
-        
-        model_safety_3.load_state_dict(torch.load(os.path.join(model_path, 'model-last-safety-3.ckpt')))
-        model_safety_3.eval()
-    
+        model.load_state_dict(torch.load(os.path.join(model_path, load_checkpoint_name(model_path, ''))))
+        model_safety_1.load_state_dict(torch.load(os.path.join(model_path, load_checkpoint_name(model_path, '-safety-1'))))
+        model_safety_2.load_state_dict(torch.load(os.path.join(model_path, load_checkpoint_name(model_path, '-safety-2'))))
+        model_safety_3.load_state_dict(torch.load(os.path.join(model_path, load_checkpoint_name(model_path, '-safety-3'))))
         print(model)
-        model.load_state_dict(torch.load(os.path.join(model_path, 'model-last.ckpt')))
     
     if not os.path.exists('run'+str(RUN_NO)+'_images'):
         os.makedirs('run'+str(RUN_NO)+'_images')
@@ -611,6 +624,7 @@ def exec_waypoint_nav_demo(args):
     steer_var = 1
     x_comps = []
     curvature_comps = []
+    steer_comps = []  # [raw NN steer, CBF-applied steer] per frame, for with/without-CBF intervention analysis
     current_x, current_y, current_yaw = 0.,0.,0.
     current_timestamp = 0.
     
@@ -621,9 +635,6 @@ def exec_waypoint_nav_demo(args):
     for frame in tqdm.tqdm(range(TOTAL_EPISODE_FRAMES)):
         measurement_data, sensor_data = client_bridge.read_data()
         
-        # spectator = world.get_spectator()
-        # vehicle_transform = ego_vehicle.get_transform()
-        # spectator.set_transform(carla.Transform(vehicle_transform.location + carla.Location(z=30), carla.Rotation(pitch=-90)))
         # --- Third-Person Chase Camera ---
         spectator = world.get_spectator()
         vehicle_transform = ego_vehicle.get_transform()
@@ -684,11 +695,11 @@ def exec_waypoint_nav_demo(args):
             
             img_array = np.array(image_converter.to_rgb_array(main_image))
             im = Image.fromarray(img_array)
-            steer_to_save = int(100*cmd_steer*180./3.14)
+            steer_to_save = int(100*cmd_steer*180./math.pi)
             if frame//5 > 0:
                 im.save('run'+str(RUN_NO)+'_images/frame_'+str(frame//5)+'_'+str(steer_to_save)+\
                     '_'+str(int(10000*curvature_save))+'_'+str(int(100*x_save))+'_'+\
-                    str(int(100*theta_save*180./3.14))+'_'+str(int(100*current_speed))+\
+                    str(int(100*theta_save*180./math.pi))+'_'+str(int(100*current_speed))+\
                     '_'+str(int(100*current_speed_perp))+'.png')
             
             # Here we push the camera frame into the Neural Networks
@@ -706,8 +717,8 @@ def exec_waypoint_nav_demo(args):
             var = 0
             for pred in preds :
                 var += (pred-cmd_steer1)**2
-            steer_var = (var/N_ITERS)**(1/2)*(3.14/180.)
-            cmd_steer1 = cmd_steer1*(3.14/180.)
+            steer_var = (var/N_ITERS)**(1/2)*(math.pi/180.)
+            cmd_steer1 = cmd_steer1*(math.pi/180.)
             Y2 = [0,0,0]
             
             # Curvature Prediction (Model 1)
@@ -744,11 +755,11 @@ def exec_waypoint_nav_demo(args):
             var = 0
             for pred in preds :
                 var += (pred-Y2[2])**2
-            theta_var = (var/N_ITERS)**(1/2)*theta_factor*3.14/180.
-            
+            theta_var = (var/N_ITERS)**(1/2)*theta_factor*math.pi/180.
+
             curvature = float(Y2[0])*curvature_factor
             x = float(Y2[1])*x_factor
-            theta = float(Y2[2])*theta_factor*3.14/180.
+            theta = float(Y2[2])*theta_factor*math.pi/180.
             print("Before ", cmd_steer1, steer_var)
             print("Predicted theta, x, curvature : ", theta, x, x_var, curvature)
             print("Observed theta, x, curvature : ", theta_save, x_save, curvature_save)
@@ -845,7 +856,9 @@ def exec_waypoint_nav_demo(args):
         vec2 = np.array(closest_angle_vector)
         val = vec2[0]*vec1[1] - vec2[1]*vec1[0]
         x_save = closest_distance*val/abs(val)
-        theta_save = rel_angle
+        # Wrap into [-pi, pi]: current_yaw and closest_angle each wrap independently at +/-pi,
+        # so their raw difference can jump to ~+/-2*pi right at that boundary without this.
+        theta_save = math.atan2(math.sin(rel_angle), math.cos(rel_angle))
         curvature_save = computeCurvature(centerline_np[closest_index_centre,:],\
             centerline_np[closest_index_centre+2,:],centerline_np[closest_index_centre+4,:])
         
@@ -856,7 +869,8 @@ def exec_waypoint_nav_demo(args):
         cmd_steer_updated = get_optimal_control(cmd_steer1, steer_var , current_speed, \
             theta_save, theta_var, x_save, x_var, curvature_save, curvature_var, \
             v_perp=current_speed_perp,omega=current_omega)
-        
+        steer_comps.append([cmd_steer1, cmd_steer_updated])
+
         if skip_first_frame and frame == 0:
             pass
         else:
@@ -893,12 +907,19 @@ def exec_waypoint_nav_demo(args):
     
     send_control_command(ego_vehicle, throttle=0.0, steer=0.0, brake=1.0)
     write_trajectory_file(x_history, y_history, speed_history, time_history,steerings_list,throttles_list)
+
+    results_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'results')
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+    mode = cbf_mode_name()
     theta_comps = np.array(theta_comps)
     x_comps = np.array(x_comps)
     curvature_comps = np.array(curvature_comps)
-    np.savetxt('theta_comps.csv',theta_comps)
-    np.savetxt('x_comps.csv',x_comps)
-    np.savetxt('curvature_comps.csv',curvature_comps)
+    steer_comps = np.array(steer_comps)
+    np.savetxt(os.path.join(results_dir, f'{mode}_theta_comps_run{RUN_NO}.csv'), theta_comps)
+    np.savetxt(os.path.join(results_dir, f'{mode}_x_comps_run{RUN_NO}.csv'), x_comps)
+    np.savetxt(os.path.join(results_dir, f'{mode}_curvature_comps_run{RUN_NO}.csv'), curvature_comps)
+    np.savetxt(os.path.join(results_dir, f'{mode}_steer_comps_run{RUN_NO}.csv'), steer_comps)
 
 def main():
     global RUN_NO
@@ -924,27 +945,20 @@ def main():
         type=int,
         help='TCP port to listen to (default: 2000)')
     argparser.add_argument(
-        '-a', '--autopilot',
-        action='store_true',
-        help='enable autopilot')
-    argparser.add_argument(
-        '-q', '--quality-level',
-        choices=['Low', 'Epic'],
-        type=lambda s: s.title(),
-        default='Low',
-        help='graphics quality level.')
-    argparser.add_argument(
-        '-c', '--carla-settings',
-        metavar='PATH',
-        dest='settings_filepath',
-        default=None,
-        help='Path to a "CarlaSettings.ini" file')
-    argparser.add_argument(
         '-r', '--run_no',
         metavar='P',
         default=-1,
         type=int,
         help='Run no')
+    cbf_group = argparser.add_mutually_exclusive_group()
+    cbf_group.add_argument(
+        '--cbf',
+        action='store_true',
+        help='force the CBF safety gate on, overriding the RUN_NO < K_ITERS ramp-up default')
+    cbf_group.add_argument(
+        '--no-cbf',
+        action='store_true',
+        help='force the CBF safety gate off, overriding the RUN_NO < K_ITERS ramp-up default')
     args = argparser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -952,12 +966,13 @@ def main():
     logging.info('listening to server %s:%s', args.host, args.port)
     if args.run_no!=-1 :
         RUN_NO = args.run_no
-    if RUN_NO < K_ITERS :
-        SAFEGUARD = False
+    if args.cbf or args.no_cbf :
+        SAFEGUARD = args.cbf
+    else :
+        SAFEGUARD = RUN_NO >= K_ITERS  # ramp-up default: CBF only kicks in once the model has had a few training iterations
     if not SAFEGUARD :
         N_ITERS = 1
-    args.out_filename_format = '_out/episode_{:0>4d}/{:s}/{:0>6d}'
-    model_path = 'saved_models_iter' + str(RUN_NO-1) 
+    model_path = 'saved_models_iter' + str(RUN_NO-1)
     
     while True:
         try:

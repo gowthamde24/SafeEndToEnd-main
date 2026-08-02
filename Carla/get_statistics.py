@@ -1,8 +1,18 @@
+import argparse
 import numpy as np
 import math
 
-n_iters = 10
-parent_dir = './cent_line_dynamic_with_cbf/controller_output/'
+argparser = argparse.ArgumentParser()
+argparser.add_argument(
+    '--mode',
+    choices=['with_cbf', 'without_cbf'],
+    default='with_cbf',
+    help='Which controller_output/<mode>/ subfolder to read trajectories from')
+argparser.add_argument('-n', '--n_iters', type=int, default=10, help='Number of run trajectories to summarize')
+args = argparser.parse_args()
+
+n_iters = args.n_iters
+parent_dir = f'./controller_output/{args.mode}/'
 ref_line = np.loadtxt(parent_dir + 'trajectory_run'+str(0)+'.txt',delimiter=',')
 dt = 0.1
 

@@ -1,74 +1,105 @@
-from turtle import width
 import numpy as np
 import matplotlib.pyplot as plt
-import sys
 import math
-import argparse 
+import argparse
 
+# Default number of trajectories to loop through
 n_trajs = 11
 
+# Parse command line arguments for run numbers
 argparser = argparse.ArgumentParser()
 argparser.add_argument(
-        '-n', '--run_no',
-        metavar='P',
-        default=-1,
-        type=int,
-        help='Run no')
+    '-n', '--run_no',
+    metavar='P',
+    default=-1,
+    type=int,
+    help='Number of run trajectories to plot'
+)
+argparser.add_argument(
+    '--mode',
+    choices=['with_cbf', 'without_cbf'],
+    default='with_cbf',
+    help='Which controller_output/<mode>/ subfolder to read trajectories from'
+)
 args = argparser.parse_args()
 
-if args.run_no != -1 :
+if args.run_no != -1:
     n_trajs = args.run_no
 
-opt_racing_line = np.loadtxt('waypoints_new.csv',delimiter=',')[:100]
+# Load optimal racing line and center waypoints
+opt_racing_line = np.loadtxt('waypoints_new.csv', delimiter=',')[:100]
+file_centre_line = 'town04_waypoints.txt'
 
-file_centre_line='racetrack_waypoints.txt'
-if file_centre_line != None:
-    centre_line = np.loadtxt(file_centre_line,delimiter = ",")
-else :
-    centre_line=None
-# centre_line[:,1] = -centre_line[:,1]
-tx_center, ty_center, tyaw_center = centre_line[:-1,0], centre_line[:-1,1], np.arctan2(centre_line[1:,1]-centre_line[:-1,1],centre_line[1:,0]-centre_line[:-1,0])
+if file_centre_line is not None:
+    centre_line = np.loadtxt(file_centre_line, delimiter=",")
+else:
+    centre_line = None
 
-# Start line
-plt.plot([tx_center[0]+np.cos(tyaw_center[0]+math.pi/2),tx_center[0]-np.cos(tyaw_center[0]+math.pi/2)],[ty_center[0]+np.sin(tyaw_center[0]+math.pi/2),ty_center[0]-np.sin(tyaw_center[0]+math.pi/2)],linewidth=5.0,color='green')#,marker='o')
-plt.text(tx_center[0],ty_center[0],'Start line')
+# Extract center coordinates and calculate track heading (yaw)
+tx_center = centre_line[:-1, 0]
+ty_center = centre_line[:-1, 1]
+tyaw_center = np.arctan2(
+    centre_line[1:, 1] - centre_line[:-1, 1],
+    centre_line[1:, 0] - centre_line[:-1, 0]
+)
 
-# Finish line
-plt.plot([tx_center[-1]+np.cos(tyaw_center[-1]+math.pi/2),tx_center[-1]-np.cos(tyaw_center[-1]+math.pi/2)],[ty_center[-1]+np.sin(tyaw_center[-1]+math.pi/2),ty_center[-1]-np.sin(tyaw_center[-1]+math.pi/2)],linewidth=5.0,color='red')#,marker='o')
-plt.text(tx_center[-1],ty_center[-1],'End line')
+# Initialize Plot Layout
+plt.figure(figsize=(6.9, 10.5))
 
-# plt.plot(-372,65,-358,65,marker='o',size=5)
+# Plot Start Line
+plt.plot(
+    [tx_center[0] + np.cos(tyaw_center[0] + math.pi/2), tx_center[0] - np.cos(tyaw_center[0] + math.pi/2)],
+    [ty_center[0] + np.sin(tyaw_center[0] + math.pi/2), ty_center[0] - np.sin(tyaw_center[0] + math.pi/2)],
+    linewidth=5.0, color='green'
+)
+plt.text(tx_center[0], ty_center[0], 'Start line', fontweight='bold')
 
-left_boundary = np.array([tx_center-7*np.sin(tyaw_center),ty_center+7*np.cos(tyaw_center)]).T
-right_boundary = np.array([tx_center+7*np.sin(tyaw_center),ty_center-7*np.cos(tyaw_center)]).T
-# traj1 = np.loadtxt('controller_output/trajectory_run1.txt',delimiter=',')
-# traj2 = np.loadtxt('controller_output/trajectory_run2.txt',delimiter=',')
-# traj3 = np.loadtxt('controller_output/trajectory_run3.txt',delimiter=',')
-# traj4 = np.loadtxt('controller_output/trajectory_run4.txt',delimiter=',')
-# traj5 = np.loadtxt('controller_output/trajectory_run5.txt',delimiter=',')
-# traj7 = np.loadtxt('controller_output/trajectory_run7.txt',delimiter=',')
-# plt.plot(traj1[:,0],traj1[:,1],'-',label="Followed trajectory (iter 1)")
-# plt.plot(traj2[:,0],traj2[:,1],'-',label="Followed trajectory (iter 2)")
-# plt.plot(traj3[:,0],traj3[:,1],'-',label="Followed trajectory (iter 3)")
-# plt.plot(traj4[:,0],traj4[:,1],'-',label="Followed trajectory (iter 4)")
-# plt.plot(traj5[:,0],traj5[:,1],'-',label="Followed trajectory (iter 5)")
+# Plot Finish Line
+plt.plot(
+    [tx_center[-1] + np.cos(tyaw_center[-1] + math.pi/2), tx_center[-1] - np.cos(tyaw_center[-1] + math.pi/2)],
+    [ty_center[-1] + np.sin(tyaw_center[-1] + math.pi/2), ty_center[-1] - np.sin(tyaw_center[-1] + math.pi/2)],
+    linewidth=5.0, color='red'
+)
+plt.text(tx_center[-1], ty_center[-1], 'End line', fontweight='bold')
 
-traj = np.loadtxt('with_cbf_dynamic_updated/controller_output/trajectory_run0.txt',delimiter=',')
-plt.plot(traj[:,0],traj[:,1],'-.',label="Center line (ref)")
+# Calculate Track Boundaries (7-meter offset)
+left_boundary = np.array([tx_center - 7 * np.sin(tyaw_center), ty_center + 7 * np.cos(tyaw_center)]).T
+right_boundary = np.array([tx_center + 7 * np.sin(tyaw_center), ty_center - 7 * np.cos(tyaw_center)]).T
 
-# plt.plot(opt_racing_line[:,0],opt_racing_line[:,1],'--',label="Optimal racing line (ref)")
-plt.plot(left_boundary[:,0],left_boundary[:,1],'--',label="Track left boundary")
-plt.plot(right_boundary[:,0],right_boundary[:,1],'--',label="Track right boundary")
-# plt.plot(tx_center,ty_center,'-',label="Center line (ref)")
-for i in range(1,n_trajs+1) :
-    traj = np.loadtxt('with_cbf_dynamic_updated/controller_output/trajectory_run'+str(i)+'.txt',delimiter=',')
-    plt.plot(traj[:,0],traj[:,1],'-',label="Followed trajectory (iter "+str(i)+")")
+# Plot Reference Line (Run 0 / Center Line)
+ref_traj_path = f'controller_output/{args.mode}/trajectory_run0.txt'
+try:
+    traj_ref = np.loadtxt(ref_traj_path, delimiter=',')
+    plt.plot(traj_ref[:, 0], traj_ref[:, 1], '-.', color='gray', label="Center line (ref)")
+except OSError:
+    print(f"Warning: Reference file {ref_traj_path} not found.")
 
-plt.xlabel("X")
-plt.ylabel("Y")
-plt.legend()
+# Plot Track Boundaries
+plt.plot(left_boundary[:, 0], left_boundary[:, 1], '--', color='black', alpha=0.6, label="Track left boundary")
+plt.plot(right_boundary[:, 0], right_boundary[:, 1], '--', color='black', alpha=0.6, label="Track right boundary")
+
+# Loop through and plot individual closed-loop iteration trajectories
+for i in range(1, n_trajs + 1):
+    traj_path = f'controller_output/{args.mode}/trajectory_run{i}.txt'
+    try:
+        traj = np.loadtxt(traj_path, delimiter=',')
+        plt.plot(traj[:, 0], traj[:, 1], '-', label=f"Followed trajectory (iter {i})")
+    except OSError:
+        # Skip missing run files gracefully without crashing the script
+        continue
+
+# Plot Formatting
+plt.xlabel("X Position (m)")
+plt.ylabel("Y Position (m)")
+plt.title("Closed-Loop Trajectory Evolution Across Iterations")
+plt.legend(loc='upper right', fontsize='small')
 plt.axis('equal')
-fig = plt.gcf()
-fig.set_size_inches(6.9, 10.5)
-plt.savefig('all_trajs_plot.png',dpi=400)
+plt.grid(True, linestyle=':', alpha=0.5)
+plt.tight_layout()
+
+# Save High-Resolution Output
+out_path = f'{args.mode}_all_trajs_plot.png'
+plt.savefig(out_path, dpi=400)
+print(f"Successfully generated and saved: {out_path}")
+
 plt.show()

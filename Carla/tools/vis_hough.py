@@ -1,3 +1,5 @@
+"""One-off script: visualizes the Hough-transform sinusoid curves for a few sample points,
+used while prototyping lane-line detection."""
 import matplotlib.pyplot as plt
 import numpy as np
 import math

@@ -1,0 +1,18 @@
+# Core pipeline: train.py, run_iter.py, plots_curves.py, plot_predictions.py,
+# path_plot.py, get_statistics.py, compare_cbf.py
+#
+# For a CPU-only torch/torchvision/torchaudio build (no GPU available), install with:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+carla==0.9.15
+numpy==2.0.2
+matplotlib==3.9.4
+pillow==11.3.0
+opencv-python==4.13.0.92
+scipy==1.13.1
+tqdm==4.68.3
+
+# Optional: only needed for vis_gradcam.py's saliency-map visualization
+# pip install grad-cam
