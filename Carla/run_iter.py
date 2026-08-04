@@ -214,9 +214,9 @@ lf = L/2.
 lr = L/2. 
 Iz = (mass*lf**2)/2.
 
-# --- TEAM EXPLANATION: TASK A (SA-TCP ARCHITECTURE) ---
-# Explain to Benedikt and Sai that this is Branch A of our proposal.
-# It uses a ResNet backbone to look at the image, processes the vehicle's current 
+# --- TASK A (SA-TCP ARCHITECTURE) ---
+# This is Branch A of the proposal.
+# It uses a ResNet backbone to look at the image, processes the vehicle's current
 # speed vectors, and outputs the optimal raw steering command.
 class EndtoEnd(models.resnet.ResNet):
     def __init__(self):
@@ -248,12 +248,12 @@ def computeCurvature(p0, p1, p2) :
 def has_crossed_train_line(x,y) :
     return (x>-50)
 
-# --- TEAM EXPLANATION: THE CONTROL BARRIER FUNCTION (CBF) ---
-# This is the most important part of the presentation. This is the "Safety Gate".
-# We pass it the steering angle from Branch A (steer_ref) and the predictions 
-# from Branch B (theta, x, curvature). 
-# Rather than getting bogged down in the derivations, explain the practical effect:
-# This function creates an imaginary "barrier" at the lane lines. If the car's 
+# --- THE CONTROL BARRIER FUNCTION (CBF) ---
+# This is the "Safety Gate".
+# It takes the steering angle from Branch A (steer_ref) and the predictions
+# from Branch B (theta, x, curvature).
+# The practical effect:
+# This function creates an imaginary "barrier" at the lane lines. If the car's
 # current trajectory (calculated via kinematics) crosses that barrier, the CBF mathematically 
 # overrides the neural network and forces a safe steering angle (min_steer).
 def get_optimal_control(steer_ref,steer_var,v,theta,theta_var,x,x_var,curvature,curvature_var,v_perp=0.,omega=0.,EPSILON=1e-1) :
@@ -405,8 +405,8 @@ def write_trajectory_file(x_list, y_list, v_list, t_list, steerings_list, thrott
             trajectory_file.write('%3.3f, %3.3f, %2.3f, %6.3f, %6.3f, %6.3f\n' %\
                                   (x_list[i], y_list[i], v_list[i], t_list[i], steerings_list[i], throttle_list[i]))
 
-# --- TEAM EXPLANATION: MAIN SIMULATION LOOP ---
-# This function orchestrates the entire closed-loop demo we recorded.
+# --- MAIN SIMULATION LOOP ---
+# This function orchestrates the entire closed-loop demo.
 def exec_waypoint_nav_demo(args):
     """ Executes waypoint navigation demo. """
 
@@ -559,8 +559,8 @@ def exec_waypoint_nav_demo(args):
     cmd_steer1 = 0
     cmd_throttle = 0
     
-    # --- TEAM EXPLANATION: MODEL INITIALIZATION ---
-    # Here we initialize the 4 separate models that make up our SA-TCP architecture.
+    # --- MODEL INITIALIZATION ---
+    # Here the 4 separate models that make up the SA-TCP architecture are initialized.
     if VEHICLE_MODEL=='Kinematic' :
         model = models.resnet18()
         in_features = model.fc.in_features
@@ -628,7 +628,7 @@ def exec_waypoint_nav_demo(args):
     current_x, current_y, current_yaw = 0.,0.,0.
     current_timestamp = 0.
     
-    # --- TEAM EXPLANATION: INFERENCE LOOP ---
+    # --- INFERENCE LOOP ---
     # This is the real-time driving loop. For every frame, the camera captures an image,
     # the 4 models process it, and the CBF acts as the safety referee before sending 
     # the final steering command back to CARLA.
@@ -862,9 +862,9 @@ def exec_waypoint_nav_demo(args):
         curvature_save = computeCurvature(centerline_np[closest_index_centre,:],\
             centerline_np[closest_index_centre+2,:],centerline_np[closest_index_centre+4,:])
         
-        # --- TEAM EXPLANATION: THE SAFETY OVERRIDE ---
-        # Remind the team that this is where the magic happens. We pass all the neural 
-        # network predictions into the CBF, and it returns 'cmd_steer_updated' which is 
+        # --- THE SAFETY OVERRIDE ---
+        # This is where the magic happens. All the neural
+        # network predictions are passed into the CBF, and it returns 'cmd_steer_updated' which is
         # mathematically guaranteed to be safe.
         cmd_steer_updated = get_optimal_control(cmd_steer1, steer_var , current_speed, \
             theta_save, theta_var, x_save, x_var, curvature_save, curvature_var, \
