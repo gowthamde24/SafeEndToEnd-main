@@ -10,10 +10,42 @@ from torch.nn.utils.rnn import pack_padded_sequence
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
+import fnmatch
 import glob
 from PIL import ImageFile
 import tqdm
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+def is_unc_path(path):
+    return path.startswith('\\\\') or path.startswith('//')
+
+
+def init_smb_session():
+    """Registers smbclient credentials from the environment (not a CLI flag, so they don't leak
+    into shell history/process listings). Mirrors run_iter.py's init_smb_session()."""
+    import smbclient
+    username = os.environ.get('SMB_USERNAME')
+    password = os.environ.get('SMB_PASSWORD')
+    if not username or not password:
+        raise RuntimeError('--output-dir is a UNC path but SMB_USERNAME/SMB_PASSWORD are not set.')
+    smbclient.ClientConfig(username=username, password=password)
+
+
+def smb_glob(output_dir, pattern):
+    """Two-level glob ('dirpattern/filepattern') over an SMB share -- glob.glob() itself can't
+    walk a UNC path. Only supports exactly this shape since it's the only pattern train.py uses
+    (default 'run<N>_images/*.png', or --image-glob 'run<N>_ep*_images/*.png')."""
+    import smbclient
+    dir_pattern, file_pattern = pattern.split('/')
+    matches = []
+    for entry in smbclient.listdir(output_dir):
+        if fnmatch.fnmatch(entry, dir_pattern):
+            dir_path = output_dir + '/' + entry
+            for f in smbclient.listdir(dir_path):
+                if fnmatch.fnmatch(f, file_pattern):
+                    matches.append(dir_path + '/' + f)
+    return matches
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -42,7 +74,9 @@ transform = transforms.Compose([
                              (0.229, 0.224, 0.225))])
 
 curvature_factor = 0.005
-x_factor = 1
+x_factor = 7  # normalizes cross-track meters to ~unit scale (half the 14m avg. Austin corridor
+              # width; matches the fixed 7m town04 half-width already used in path_plot.py /
+              # compare_cbf.py), matching how curvature_factor/theta_factor normalize their heads
 theta_factor = 5
 
 # "Accuracy" for this regression task = % of predictions within a physical-unit tolerance
@@ -70,8 +104,17 @@ losses_3 = []
 
 def split_dataset(image_paths, block_size=BLOCK_SIZE, val_fraction=VAL_FRACTION,
                    test_fraction=TEST_FRACTION, seed=SPLIT_SEED):
-    'Splits sorted, sequential frames into train/val/test by contiguous block (see BLOCK_SIZE).'
-    blocks = [image_paths[i:i + block_size] for i in range(0, len(image_paths), block_size)]
+    """Splits sorted, sequential frames into train/val/test by contiguous block (see BLOCK_SIZE).
+    Blocks are chunked per parent folder (not across the flat sorted list), so a block never mixes
+    frames from two different collection episodes/runs when image_paths pools multiple run*_images/
+    folders (see collect_dataset.py)."""
+    blocks = []
+    folder_start = 0
+    for i in range(1, len(image_paths) + 1):
+        if i == len(image_paths) or os.path.dirname(image_paths[i]) != os.path.dirname(image_paths[folder_start]):
+            folder_paths = image_paths[folder_start:i]
+            blocks.extend(folder_paths[j:j + block_size] for j in range(0, len(folder_paths), block_size))
+            folder_start = i
     rng = random.Random(seed)
     rng.shuffle(blocks)
 
@@ -124,7 +167,13 @@ class croppedDataset(Dataset):
     def __getitem__(self, index):
         'Generates one sample of data'
         image_path = self.ims[index]
-        image = Image.open(image_path)
+        if is_unc_path(image_path):
+            import smbclient
+            with smbclient.open_file(image_path, mode='rb') as f:
+                image = Image.open(f)
+                image.load()  # PIL.Image.open is lazy -- force the read before the handle closes
+        else:
+            image = Image.open(image_path)
         X = self.transform(image)
         
         # Safely extract just the filename without the folder path
@@ -197,7 +246,12 @@ def main(args):
     if not os.path.exists(model_path):
         os.makedirs(model_path)
         
-    image_paths = glob.glob(IMAGE_FOLDER+'/*.png')
+    glob_pattern = args.image_glob if args.image_glob else IMAGE_FOLDER + '/*.png'
+    if is_unc_path(args.output_dir):
+        init_smb_session()
+        image_paths = smb_glob(args.output_dir, glob_pattern)
+    else:
+        image_paths = glob.glob(os.path.join(args.output_dir, glob_pattern))
     image_paths.sort()
 
     train_paths, val_paths, test_paths = split_dataset(image_paths)
@@ -408,6 +462,18 @@ if __name__ == '__main__':
         default=-1,
         type=int,
         help='Run no')
+    argparser.add_argument(
+        '--image-glob',
+        default=None,
+        help="glob pattern for training images, overriding the default single 'run<N>_images/*.png' "
+             "folder -- e.g. 'run0_ep*_images/*.png' to pool frames from a collect_dataset.py run")
+    argparser.add_argument(
+        '--output-dir',
+        default='.',
+        help='root directory the image glob is resolved against (default: current directory). Set '
+             'this to match the --output-dir used during collection. If it\'s a UNC path '
+             '(\\\\host\\share), images are read directly over SMB (SMB_USERNAME/SMB_PASSWORD env '
+             'vars required) -- no local disk usage, useful when the dataset is too large to stage.')
     args = argparser.parse_args()
     
     main(args)

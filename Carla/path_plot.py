@@ -1,7 +1,27 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import math
 import argparse
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# Mirrors run_iter.py's TRACKS config (kept separate to avoid this analysis-only script
+# depending on carla/torch). boundary_half_width matches the historical fixed 7m plot offset for
+# town04; austin_map instead uses the real per-point corridor width from the source CSV, since a
+# single constant would misrepresent a real track whose width varies 11-27.6m.
+TRACK_CONFIGS = {
+    'town04': {
+        'centerline_file': 'town04_waypoints.txt',
+        'boundary_half_width': 7.,
+        'width_source_csv': None,
+    },
+    'austin_map': {
+        'centerline_file': 'austin_waypoints.txt',
+        'boundary_half_width': None,
+        'width_source_csv': os.path.join(SCRIPT_DIR, 'racetrack_source', 'Austin.csv'),
+    },
+}
 
 # Default number of trajectories to loop through
 n_trajs = 11
@@ -21,19 +41,23 @@ argparser.add_argument(
     default='with_cbf',
     help='Which controller_output/<mode>/ subfolder to read trajectories from'
 )
+argparser.add_argument(
+    '--track',
+    default='austin_map',
+    choices=sorted(TRACK_CONFIGS.keys()),
+    help='which track the runs were collected on (default: austin_map; pass --track town04 for '
+         'the original Phase 1 baseline runs)'
+)
 args = argparser.parse_args()
 
 if args.run_no != -1:
     n_trajs = args.run_no
 
-# Load optimal racing line and center waypoints
-opt_racing_line = np.loadtxt('waypoints_new.csv', delimiter=',')[:100]
-file_centre_line = 'town04_waypoints.txt'
+track_cfg = TRACK_CONFIGS[args.track]
 
-if file_centre_line is not None:
-    centre_line = np.loadtxt(file_centre_line, delimiter=",")
-else:
-    centre_line = None
+# Load center waypoints for the selected track
+file_centre_line = track_cfg['centerline_file']
+centre_line = np.loadtxt(file_centre_line, delimiter=",")
 
 # Extract center coordinates and calculate track heading (yaw)
 tx_center = centre_line[:-1, 0]
@@ -62,9 +86,14 @@ plt.plot(
 )
 plt.text(tx_center[-1], ty_center[-1], 'End line', fontweight='bold')
 
-# Calculate Track Boundaries (7-meter offset)
-left_boundary = np.array([tx_center - 7 * np.sin(tyaw_center), ty_center + 7 * np.cos(tyaw_center)]).T
-right_boundary = np.array([tx_center + 7 * np.sin(tyaw_center), ty_center - 7 * np.cos(tyaw_center)]).T
+# Calculate Track Boundaries -- real per-point width for austin_map, fixed 7m offset for town04
+if track_cfg['width_source_csv']:
+    _widths = np.loadtxt(track_cfg['width_source_csv'], delimiter=',', skiprows=1)
+    half_width = (_widths[:-1, 2] + _widths[:-1, 3]) / 2.
+else:
+    half_width = track_cfg['boundary_half_width']
+left_boundary = np.array([tx_center - half_width * np.sin(tyaw_center), ty_center + half_width * np.cos(tyaw_center)]).T
+right_boundary = np.array([tx_center + half_width * np.sin(tyaw_center), ty_center - half_width * np.cos(tyaw_center)]).T
 
 # Plot Reference Line (Run 0 / Center Line)
 ref_traj_path = f'controller_output/{args.mode}/trajectory_run0.txt'

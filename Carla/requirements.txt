@@ -16,3 +16,7 @@ tqdm==4.68.3
 
 # Optional: only needed for vis_gradcam.py's saliency-map visualization
 # pip install grad-cam
+
+# Optional: only needed for run_iter.py/collect_dataset.py when --output-dir is a UNC path
+# (\\host\share), to write/count collected frames directly over SMB without a kernel mount
+# pip install smbprotocol

@@ -1,7 +1,18 @@
 # SafeEndToEnd: SA-TCP Architecture & Control Barrier Functions in CARLA
 
 ##  Overview
-This repository contains the implementation and Phase 1 baseline replication of the Safe Autonomous Trajectory Control Prediction (SA-TCP) architecture. The system executes closed-loop autonomous driving in the CARLA simulator (Town 04) by combining an End-to-End (E2E) neural network with a mathematical Control Barrier Function (CBF) safety gate.
+This repository contains the implementation and Phase 1 baseline replication of the Safe Autonomous Trajectory Control Prediction (SA-TCP) architecture. The system executes closed-loop autonomous driving in the CARLA simulator (Town 04, and a custom real-world-derived Austin/COTA track) by combining an End-to-End (E2E) neural network with a mathematical Control Barrier Function (CBF) safety gate.
+
+This README is the reproducibility reference (how to run things). For the research record --
+related work comparison, methodology writeup, experiment log, a dated decision trail with
+rationale, the results-chapter scaffold, and citations (useful for a thesis defense) -- see
+[`docs/`](docs/related_work.md):
+[`docs/related_work.md`](docs/related_work.md) &middot;
+[`docs/methodology.md`](docs/methodology.md) &middot;
+[`docs/experiments.md`](docs/experiments.md) &middot;
+[`docs/decisions.md`](docs/decisions.md) &middot;
+[`docs/results.md`](docs/results.md) &middot;
+[`docs/references.bib`](docs/references.bib)
 
 ##  Architecture Breakdown
 The pipeline processes live RGB camera feeds via a PyTorch ResNet backbone, split into two primary branches:
@@ -12,6 +23,109 @@ The pipeline processes live RGB camera feeds via a PyTorch ResNet backbone, spli
   * Heading Error (Theta)
   * Road Curvature
 * **Control Barrier Function (CBF):** Acts as the system's "Safety Gate." It evaluates the raw steering command from Branch A against the spatial state predicted by Branch B. By projecting the vehicle's trajectory using a Kinematic or Dynamic bicycle model, the CBF actively overrides the neural network with a mathematically guaranteed safe steering angle if lane boundaries are threatened.
+
+---
+
+##  CBF Safety Gate: How It Works
+
+A walkthrough of `get_optimal_control()` (`run_iter.py`, `get_optimal_control` -- currently lines
+277-346), mapping each term in the code to standard control-barrier-function theory. No code
+behavior is described here beyond what's actually implemented.
+
+**The problem it solves.** Branch A outputs a raw steering command `steer_ref` (plus an
+MC-dropout uncertainty `steer_var`); Branch B outputs curvature/`x`/`theta` state estimates
+(each with their own predicted variance). `get_optimal_control()` never trusts Branch A
+blindly -- it searches for the steering angle closest to `steer_ref` that keeps the predicted
+trajectory inside the lane corridor, using Branch B's state estimate to check.
+
+**The barrier functions.** Two barrier functions bound the cross-track error `x` on each side
+of the lane:
+```
+h_left  = LANE_WIDTH/2 - x
+h_right = LANE_WIDTH/2 + x
+```
+Both are >= 0 exactly when `|x| <= LANE_WIDTH/2`. Being inside the corridor right now isn't
+enough for a CBF -- it also has to guarantee the car *stays* inside (forward invariance), so
+the code also computes `hd`/`hdd` (the barrier's rate of change under the bicycle-model
+dynamics), not just `h` itself.
+
+**Relative degree (why two different formulas).** Steering doesn't affect `x` directly -- it
+works through heading, then lateral velocity, then position. How many integrators sit between
+steering and `h` (the relative degree) decides how many derivatives of `h` the barrier needs:
+
+- **Kinematic model** (`VEHICLE_MODEL == 'Kinematic'`), relative degree 2:
+  ```
+  hdd_left + lambda*hd_left + lambda**2*h_left  >=  0
+  ```
+  `lambda = lambda_ = 5`. The coefficients `1, lambda, lambda**2` are `(s+lambda)**2`
+  expanded -- both roots of the constraint's characteristic polynomial at `-lambda`, so a
+  violation decays exponentially rather than being clamped once.
+
+- **Dynamic model** (used at higher speed, where tire slip matters -- adds cornering
+  stiffness `Cf`/`Cr`), relative degree 3:
+  ```
+  hddd_left + 3*lambda*hdd_left + 3*lambda**2*hd_left + lambda**3*h_left  >=  0
+  ```
+  `1, 3*lambda, 3*lambda**2, lambda**3` is `(s+lambda)**3` expanded -- same idea, one degree
+  higher.
+
+  *Worth checking against the paper:* the dynamic branch also bounds the heading angle
+  (`h_theta_left/right`, `|theta| <= THETA_LIM`), which only has two derivatives available
+  (`hd_theta`, `hdd_theta` -- no third), yet its constraint reuses the same `1, 3*lambda,
+  3*lambda**2` coefficients as the degree-3 position barrier rather than the degree-2 form
+  (`1, 2*lambda, lambda**2`) that strict HOCBF theory would call for. Not necessarily wrong
+  (it's a more conservative, differently-tuned constraint either way), but it's the one place
+  the implementation visibly diverges from a by-the-book derivation.
+
+**Turning it into a chance constraint.** `x`, `theta`, and `curvature` are MC-dropout
+estimates with predicted variances, not exact values. The code propagates that uncertainty
+through the barrier and shaves a safety margin off the top:
+```
+var_left = sqrt( (lambda**2*x_var)**2 + (v**2*sin(theta)*steer/L)**2
+                + (v**2*curvature_var)**2 + (lambda*v*cos(theta)*theta_var)**2 )
+
+hdd_left + lambda*hd_left + lambda**2*h_left - var_left*Phi_inv(1-BETA)  >=  0
+```
+`var_left` is a linearized (delta-method) propagation of `x_var`/`curvature_var`/`theta_var`
+through the barrier expression; `Phi_inv(1-BETA)` is `norm.ppf(1-BETA)`, the one-sided
+Gaussian quantile for confidence `1-BETA`. Mean-minus-`z*sigma` is exactly how
+`P(h >= 0) >= 1-BETA` becomes a deterministic inequality under a Gaussian approximation --
+when the network is less confident, the margin grows and the CBF intervenes earlier.
+
+**Solving it: a grid search standing in for a QP.** The textbook approach is a small convex
+QP minimizing `||u - u_ref||**2` subject to the barrier inequality. Steering here is
+one-dimensional and bounded, so instead of a QP solver the code sweeps the full range at 0.01
+resolution:
+```
+for steer in arange(-MAX_STEER, MAX_STEER, 0.01):
+    cost = (steer - steer_ref)**2 / steer_var**2
+    if barrier_left(steer)  < 0: cost += alpha * barrier_left(steer)**2
+    if barrier_right(steer) < 0: cost += alpha * barrier_right(steer)**2
+    keep steer with the lowest cost
+```
+`alpha = 20`. The tracking term is Branch A's deviation cost, inversely weighted by its own
+confidence (`steer_var`) -- a confident prediction is expensive to deviate from, an uncertain
+one is cheap. This is a **penalty-method approximation** of the CBF-QP, not an exact solve:
+violating candidates aren't excluded, just made expensive. With `alpha` heavily outweighing
+the variance-normalized tracking cost, a barrier-violating steer will almost never win in
+practice -- but it's a soft constraint, not a hard guarantee.
+
+**The off switch.** `if SAFEGUARD == False: return steer_ref` bypasses all of the above --
+this is what `--cbf`/`--no-cbf` and the `RUN_NO >= K_ITERS` ramp-up default control, and
+exactly the switch `compare_cbf.py` uses to produce its with/without-CBF comparison.
+
+**Symbol map:**
+
+| Code | Meaning | CBF-theory role |
+|---|---|---|
+| `h_left` / `h_right` | Distance to each lane edge | Barrier function `h` |
+| `lambda_` (= 5) | Shared decay-rate constant | K-class coefficient, roots at `-lambda` |
+| `alpha` (= 20) | Violation penalty weight | Penalty-method weight, not part of CBF theory itself |
+| `BETA` | Target confidence level | Chance-constraint risk bound, `P(h>=0) >= 1-BETA` |
+| `norm.ppf(1-BETA)` | Gaussian one-sided quantile | The "z" in `mean - z*sigma` margin tightening |
+| `x_var`, `theta_var`, `curvature_var` | Branch B's predictive variances | Propagated into `var_left`/`var_right` via linearization |
+| `steer_var` | Branch A's predictive variance | Inverse-confidence weight on the tracking cost |
+| `L`, `Cf`, `Cr`, `mass`, `lf`, `lr`, `Iz` | Bicycle-model physical constants | Plant model used to compute `hd`/`hdd`/`hddd` |
 
 ---
 

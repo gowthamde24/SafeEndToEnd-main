@@ -1,0 +1,84 @@
+% References for the thesis. Cite with \cite{key} if using LaTeX, or format manually for other
+% tools. Cross-referenced from docs/related_work.md and docs/methodology.md.
+
+@inproceedings{kalaria2023safety,
+  author    = {Kalaria, Dvij and Lin, Qin and Dolan, John M.},
+  title     = {Towards Safety Assured End-to-End Vision-Based Control for Autonomous Racing},
+  booktitle = {IFAC-PapersOnLine},
+  volume    = {56},
+  number    = {2},
+  pages     = {2767--2773},
+  year      = {2023},
+  doi       = {10.1016/j.ifacol.2023.10.1375},
+  note      = {Primary reference for the SA-TCP decoupled control/state-network architecture and
+               probabilistic CBF safety gate. See docs/related_work.md for an itemized comparison
+               against this project's implementation.}
+}
+
+@misc{tum_racetrack_database,
+  author = {{TUM Institute of Automotive Technology}},
+  title  = {racetrack-database},
+  year   = {2020},
+  howpublished = {\url{https://github.com/TUMFTM/racetrack-database}},
+  note   = {LGPLv3. Source of the Austin (COTA) centerline+width data used to generate
+            Carla/tracks/austin.xodr; see tools/track_to_opendrive.py.}
+}
+
+@article{heilmeier2020minimum,
+  author  = {Heilmeier, Alexander and Wischnewski, Alexander and Hermansdorfer, Leonhard and
+             Betz, Johannes and Lienkamp, Markus and Lohmann, Boris},
+  title   = {Minimum Curvature Trajectory Planning and Control for an Autonomous Race Car},
+  journal = {Vehicle System Dynamics},
+  volume  = {58},
+  number  = {10},
+  pages   = {1497--1527},
+  year    = {2020},
+  note    = {Minimum-curvature optimization method the TUM racetrack-database's racing lines
+             were computed with; also the basis for the optimal-racing-line formulation in
+             Kalaria et al. 2023 (their Eq. 3).}
+}
+
+@inproceedings{dosovitskiy2017carla,
+  author    = {Dosovitskiy, Alexey and Ros, German and Codevilla, Felipe and Lopez, Antonio and
+               Koltun, Vladlen},
+  title     = {{CARLA}: An Open Urban Driving Simulator},
+  booktitle = {Proceedings of the 1st Annual Conference on Robot Learning},
+  year      = {2017},
+  note      = {Simulator used throughout. The Austin track uses CARLA's standalone OpenDRIVE
+               world generation (client.generate\_opendrive\_world), not a UE4 content map.}
+}
+
+@article{gal2016dropout,
+  author  = {Gal, Yarin and Ghahramani, Zoubin},
+  title   = {Dropout as a Bayesian Approximation: Representing Model Uncertainty in Deep Learning},
+  journal = {arXiv preprint arXiv:1506.02142},
+  year    = {2016},
+  note    = {MC-dropout epistemic uncertainty estimation method used for both this project's and
+             Kalaria et al.'s Branch A/B uncertainty estimates (steer\_var, x\_var, theta\_var,
+             curvature\_var).}
+}
+
+@inproceedings{xiao2019hocbf,
+  author    = {Xiao, Wei and Belta, Calin A.},
+  title     = {Control Barrier Functions for Systems with High Relative Degree},
+  booktitle = {2019 IEEE 58th Conference on Decision and Control (CDC)},
+  pages     = {474--479},
+  year      = {2019},
+  note      = {Higher-order CBF (HOCBF) theory this project's and Kalaria et al.'s degree-2/3
+               barrier constraints are built on. Relevant to the open CBF re-derivation task in
+               docs/decisions.md.}
+}
+
+@inproceedings{ross2011dagger,
+  author    = {Ross, St\'{e}phane and Gordon, Geoffrey and Bagnell, Drew},
+  title     = {A Reduction of Imitation Learning and Structured Prediction to No-Regret Online
+               Learning},
+  booktitle = {Proceedings of the Fourteenth International Conference on Artificial Intelligence
+               and Statistics},
+  pages     = {627--635},
+  year      = {2011},
+  note      = {DAgger. This project's randomized-spawn-offset recovery-data collection (see
+               docs/decisions.md, 2026-08-16 entry) is a lightweight approximation of DAgger's
+               on-policy recovery data, using CARLA's autopilot rather than an explicit expert
+               correction loop.}
+}

@@ -57,6 +57,14 @@ SAFEGUARD = None  # Resolved in main() from --cbf/--no-cbf, or the K_ITERS ramp-
 K_ITERS = 3
 VEHICLE_MODEL = 'Dynamic'
 
+# CARLA defaults to a 30 km/h speed limit on OpenDRIVE roads with no <type><speed> element
+# (ours doesn't define one) -- confirmed empirically the autopilot was cruising at a steady
+# ~8 m/s the whole episode, nowhere near the "cornering-limits" racing pace this project is
+# framed around. -200 targets ~3x the limit (~90 km/h); live-tested for 35s/~500m including a
+# real corner (Austin's route data) with zero collisions -- speed ranged ~8.7-24.4 m/s, i.e. it
+# still slows appropriately for corners rather than just being uniformly faster everywhere.
+AUTOPILOT_SPEED_DIFF_PERCENT = -200
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(device)
 image_size = 256
@@ -166,6 +174,11 @@ Configurable params
 ITER_FOR_SIM_TIMESTEP  = 10     # no. iterations to compute approx sim timestep
 WAIT_TIME_BEFORE_START = 3.00   # game seconds (time before controller start)
 TOTAL_RUN_TIME         = 200.00 # game seconds (total runtime before sim end)
+STALL_SPEED_THRESHOLD  = 0.3    # m/s -- below this counts as "not moving" for the stall watchdog
+STALL_TIMEOUT_SECONDS  = 10.0   # abort the episode if stalled this long post-startup (autopilot
+                                 # can get stuck against the track boundary at some randomized-spawn
+                                 # points and otherwise just sit there for the rest of the episode,
+                                 # recording hundreds of useless identical frames -- see docs/experiments.md)
 TOTAL_FRAME_BUFFER     = 300    # number of frames to buffer after total runtime
 NUM_PEDESTRIANS        = 0      # total number of pedestrians to spawn
 NUM_VEHICLES           = 0      # total number of vehicles to spawn
@@ -183,6 +196,25 @@ WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 600
 WAYPOINTS_FILENAME = 'town04_waypoints.txt'  # waypoint file to load
 CENTERLINE_FILENAME = 'town04_waypoints.txt'
+
+# --- TRACKS: per-track config selected via --track. lane_width feeds the CBF's LANE_WIDTH
+# constant below (see main()) -- Town04's is a synthetic corridor guess, Austin's is the real
+# average corridor width from racetrack_source/Austin.csv (w_tr_left+w_tr_right, ~14m avg,
+# 11-27.6m range) so the barrier reflects the actual track rather than reusing Town04's number.
+TRACKS = {
+    'town04': {
+        'waypoints_file': 'town04_waypoints.txt',
+        'centerline_file': 'town04_waypoints.txt',
+        'lane_width': 11,
+    },
+    'austin_map': {
+        'waypoints_file': 'austin_waypoints.txt',
+        'centerline_file': 'austin_waypoints.txt',
+        'xodr_file': os.path.join(os.path.dirname(os.path.realpath(__file__)), 'tracks', 'austin.xodr'),
+        'lane_width': 14,
+        'source_csv': os.path.join(os.path.dirname(os.path.realpath(__file__)), 'racetrack_source', 'Austin.csv'),
+    },
+}
 DIST_THRESHOLD_TO_LAST_WAYPOINT = 2.0  # some distance from last position before simulation ends
                                        
 # Path interpolation parameters
@@ -203,7 +235,9 @@ L = 3.
 lambda_ = 5.
 alpha = 20.
 curvature_factor = 0.005
-x_factor = 1
+x_factor = 7  # must match train.py's x_factor -- this is the inverse of the scaling applied to
+              # the cross-track target before training, needed to decode model_safety_2's raw
+              # output back into real meters
 theta_factor = 5
 THETA_LIM = 37.*(math.pi/180.)
 
@@ -374,6 +408,40 @@ def send_control_command(vehicle, throttle, steer, brake, hand_brake=False, reve
     control.reverse = bool(reverse)
     vehicle.apply_control(control)
 
+def is_unc_path(path):
+    return path.startswith('\\\\') or path.startswith('//')
+
+def init_smb_session(output_dir):
+    """Registers smbclient credentials once, if --output-dir is a UNC path like
+    \\\\CHERRY\\CarlaData. Reads SMB_USERNAME/SMB_PASSWORD from the environment (not a CLI
+    flag, so they don't leak into shell history or process listings)."""
+    if not is_unc_path(output_dir):
+        return
+    import smbclient
+    username = os.environ.get('SMB_USERNAME')
+    password = os.environ.get('SMB_PASSWORD')
+    if not username or not password:
+        raise RuntimeError(
+            '--output-dir is a UNC path but SMB_USERNAME/SMB_PASSWORD are not set in the '
+            'environment (export them before running).')
+    smbclient.ClientConfig(username=username, password=password)
+
+def makedirs_maybe_smb(path):
+    if is_unc_path(path):
+        import smbclient
+        smbclient.makedirs(path, exist_ok=True)
+    elif not os.path.exists(path):
+        os.makedirs(path)
+
+def save_image_maybe_smb(image, path):
+    """image is a PIL Image; path may be a local path or a UNC path under a --output-dir share."""
+    if is_unc_path(path):
+        import smbclient
+        with smbclient.open_file(path, mode='wb') as f:
+            image.save(f, format='PNG')
+    else:
+        image.save(path)
+
 def create_controller_output_dir(output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -392,6 +460,93 @@ def store_trajectory_plot(graph, fname):
     file_name = os.path.join(CONTROLLER_OUTPUT_FOLDER, fname)
     graph.savefig(file_name)
 
+def spawn_track_scenery(world, track_cfg, haybale_spacing_m=60,
+                         scenery_spacing_m=200, cone_corner_threshold_deg=12):
+    """Scatters occasional hay-bale run-off stacks, corner cones, and sparse background props
+    along a custom OpenDRIVE track's edges, using the same per-point centerline+width data
+    tools/track_to_opendrive.py built the .xodr from.
+
+    Custom OpenDRIVE worlds are otherwise bare road mesh with no ground/terrain at all --
+    confirmed visually (see docs/experiments.md) that everything off the drivable surface
+    renders as CARLA's default flat-blue void. A low wall_height (set on
+    OpendriveGenerationParameters where the world is generated) fixes the void.
+
+    NOTE: this used to also place a continuous static.prop.chainbarrier fence along both edges,
+    which looked good in isolated screenshots but had two real problems found only once actually
+    driven: (1) its chain visually linked to the nearest other chainbarrier instance regardless
+    of which side of the track it was on, so at narrow points/tight bends a chain could stretch
+    straight across the drivable surface; (2) static props simulate physics by default, so the
+    vehicle could snag a chain and drag the post down the track, corrupting whatever was being
+    recorded. Removed entirely per explicit instruction rather than reworked -- see
+    docs/decisions.md, 2026-08-16.
+
+    Runs once per episode (generate_opendrive_world() rebuilds the world from scratch each
+    time). No-op for tracks without a 'source_csv' (e.g. town04, which has real scenery baked
+    into the map already). Static props only; try_spawn_actor so occasional collisions between
+    adjacent props are skipped, not fatal."""
+    source_csv = track_cfg.get('source_csv')
+    if not source_csv:
+        return 0, 0
+    data = np.loadtxt(source_csv, delimiter=',', skiprows=1)
+    points = data[:, :2]
+    widths = data[:, 2] + data[:, 3]  # w_tr_right + w_tr_left, matches the .xodr's lane width
+    n = points.shape[0]
+
+    deltas = np.roll(points, -1, axis=0) - points
+    seg_lengths = np.linalg.norm(deltas, axis=1)
+    headings = np.arctan2(deltas[:, 1], deltas[:, 0])
+    mean_spacing = float(np.mean(seg_lengths))
+    dh_deg = np.degrees(np.abs((np.diff(headings, append=headings[0]) + math.pi) % (2 * math.pi) - math.pi))
+
+    haybale_step = max(1, round(haybale_spacing_m / mean_spacing))
+    scenery_step = max(1, round(scenery_spacing_m / mean_spacing))
+
+    bp_lib = world.get_blueprint_library()
+    haybale_bp = bp_lib.find('static.prop.haybale')
+    cone_bp = bp_lib.find('static.prop.trafficcone01')
+    scenery_bps = [bp for bp in (bp_lib.find('static.prop.gardenlamp'), bp_lib.find('static.prop.streetsign01')) if bp]
+
+    spawned, skipped = 0, 0
+
+    def try_spawn(bp, x, y, yaw_deg=0.0):
+        nonlocal spawned, skipped
+        if bp is None:
+            return
+        transform = carla.Transform(carla.Location(x=float(x), y=float(y), z=0.1), carla.Rotation(yaw=yaw_deg))
+        actor = world.try_spawn_actor(bp, transform)
+        if actor is not None:
+            # Static props simulate physics by default (confirmed empirically: a chainbarrier's
+            # chain got caught on the ego vehicle and was dragged down the track, corrupting a
+            # collection episode -- see docs/experiments.md). Pin every prop in place so a close
+            # pass can't move it, regardless of which prop type this ends up being used for.
+            actor.set_simulate_physics(False)
+            spawned += 1
+        else:
+            skipped += 1
+
+    for i in range(n):
+        right_x, right_y = math.sin(headings[i]), -math.cos(headings[i])  # unit vector, right of travel direction
+        half_w = widths[i] / 2.0
+        yaw_deg = math.degrees(headings[i])
+
+        if i % haybale_step == 0 and haybale_bp:
+            off = half_w + 1.2  # just outside the true lane edge, like a run-off-area stack
+            for sign in (-1, 1):
+                try_spawn(haybale_bp, points[i, 0] + sign * right_x * off, points[i, 1] + sign * right_y * off)
+
+        if dh_deg[i] > cone_corner_threshold_deg:
+            off = half_w + 1.0
+            for sign in (-1, 1):
+                try_spawn(cone_bp, points[i, 0] + sign * right_x * off, points[i, 1] + sign * right_y * off)
+
+        if i % scenery_step == 0 and scenery_bps:
+            off = half_w + 4.0
+            bp = scenery_bps[(i // scenery_step) % len(scenery_bps)]
+            try_spawn(bp, points[i, 0] + right_x * off, points[i, 1] + right_y * off)
+
+    print(f"Track scenery: spawned {spawned} props ({skipped} skipped due to collision)")
+    return spawned, skipped
+
 def cbf_mode_name():
     return 'with_cbf' if SAFEGUARD else 'without_cbf'
 
@@ -407,14 +562,46 @@ def write_trajectory_file(x_list, y_list, v_list, t_list, steerings_list, thrott
 
 # --- MAIN SIMULATION LOOP ---
 # This function orchestrates the entire closed-loop demo.
-def exec_waypoint_nav_demo(args):
-    """ Executes waypoint navigation demo. """
+def exec_waypoint_nav_demo(args, spawn_seed_offset=0):
+    """ Executes waypoint navigation demo. spawn_seed_offset varies the randomize-spawn draw
+    across main()'s retry attempts -- without it, a deterministic --seed that happens to draw a
+    spawn point the autopilot stalls at (see STALL_SPEED_THRESHOLD above) would retry forever
+    against the identical doomed point instead of ever trying a different one."""
+    init_smb_session(args.output_dir)
 
     # --- 1. CONNECT & SETUP WORLD ---
     client = carla.Client(args.host, args.port)
     client.set_timeout(60.0)
-    world = client.load_world('Town04') # Spawns the high-speed highway environment
-    
+    track_cfg = TRACKS[args.track]
+    if args.track == 'town04':
+        world = client.load_world('Town04') # Spawns the high-speed highway environment
+    else:
+        with open(track_cfg['xodr_file']) as xodr_handle:
+            opendrive_str = xodr_handle.read()
+        # wall_height/additional_width: generate_opendrive_world() otherwise produces *only* the
+        # road mesh -- no ground/terrain at all, so the camera sees an infinite flat default-blue
+        # void everywhere off the drivable surface (confirmed visually; see docs/experiments.md).
+        # This wall is the sole edge-boundary mechanism now (spawn_track_scenery()'s props,
+        # including a chainbarrier fence, were all removed -- see docs/decisions.md, 2026-08-16).
+        # wall_height=0.4 (curb height) turned out not to be a real physical barrier: an autopilot
+        # drift during collection carried the vehicle straight through it and ~7.5m into the void
+        # before the autopilot gave up and parked there indefinitely (confirmed via
+        # world.get_actors() -- vehicle 14.7m from centerline where the corridor half-width was
+        # only 7.2m; see docs/experiments.md). Raised to 0.8m -- a real concrete/Armco trackside
+        # barrier height, not an arena wall -- after empirically confirming 0.8/1.0/1.5m all stop
+        # a vehicle driven full-throttle straight at the wall at the identical ~5m distance (well
+        # short of the 7.5m true lane edge): the extra height above 0.8m wasn't doing anything
+        # functionally, so there's no containment reason to go taller than a realistic barrier.
+        # additional_width left at 0: a nonzero paved shoulder put visible daylight between the
+        # true lane edge and the wall, which at sharper bends read as a confusing second surface
+        # rather than a clean boundary (see docs/experiments.md).
+        odr_params = carla.OpendriveGenerationParameters(
+            vertex_distance=2.0, max_road_length=500.0, wall_height=0.8,
+            additional_width=0.0, smooth_junctions=True, enable_mesh_visibility=True,
+            enable_pedestrian_navigation=False,
+        )
+        world = client.generate_opendrive_world(opendrive_str, odr_params, reset_settings=True)
+
     # Set synchronous mode so our Python script dictates the frame rate
     settings = world.get_settings()
     settings.synchronous_mode = True
@@ -424,17 +611,85 @@ def exec_waypoint_nav_demo(args):
     traffic_manager = client.get_trafficmanager(8000)
     traffic_manager.set_synchronous_mode(True)
     
+    # --- WEATHER ---
+    weather_preset = getattr(carla.WeatherParameters, args.weather, None)
+    if weather_preset is None:
+        raise ValueError(f"Unknown --weather preset '{args.weather}'; see carla.WeatherParameters for valid names.")
+    world.set_weather(weather_preset)
+    # spawn_track_scenery() (haybale/cone/background props) disabled entirely per explicit
+    # instruction -- the track should have no scattered obstacles at all. Kept defined below in
+    # case scenery is revisited later; see docs/decisions.md, 2026-08-16. The low wall_height on
+    # odr_params above still prevents the flat-blue-void issue -- that's road geometry, not a
+    # discrete obstacle, and wasn't part of what was flagged.
+
     blueprint_library = world.get_blueprint_library()
+
+    # --- WAYPOINTS (loaded early: --randomize-spawn needs the route to pick a spawn point from) ---
+    waypoints_file = track_cfg['waypoints_file']
+    with open(waypoints_file) as waypoints_file_handle:
+        waypoints = list(csv.reader(waypoints_file_handle,
+                                    delimiter=',',
+                                    quoting=csv.QUOTE_NONNUMERIC))
+        waypoints_np = np.array(waypoints)
+
+    centerline_file = track_cfg['centerline_file']
+    with open(centerline_file) as waypoints_file_handle:
+        centerline = list(csv.reader(waypoints_file_handle,
+                                    delimiter=',',
+                                    quoting=csv.QUOTE_NONNUMERIC))
+        centerline_np = np.array(centerline)
 
     # --- 2. SPAWN EGO VEHICLE ---
     vehicle_bp = blueprint_library.filter('vehicle.lincoln.mkz_2017')[0]
     spawn_points = world.get_map().get_spawn_points()
-    start_pose = spawn_points[PLAYER_START_INDEX]
-    ego_vehicle = world.spawn_actor(vehicle_bp, start_pose)
+    effective_seed = None if args.seed is None else args.seed + spawn_seed_offset
+    rng = random.Random(effective_seed)
+    if args.randomize_spawn:
+        # Pick a random point along the route (leaving enough road ahead for a real episode),
+        # snap it to the lane center, then perturb sideways/yaw so the autopilot has to
+        # steer back to center -- that recovery arc is the DAgger-style training signal.
+        # Uses try_spawn_actor + resampling (not spawn_actor, which raises) because a
+        # perturbed point can land in a collision (guardrail, overpass support, etc.); each
+        # retry draws a fresh point from rng rather than repeating the same doomed one, which
+        # matters because main()'s outer loop retries this whole function on any exception
+        # with the same args/seed -- a deterministic collision would otherwise retry forever.
+        route_margin = 500
+        max_spawn_attempts = 20
+        ego_vehicle = None
+        for attempt in range(max_spawn_attempts):
+            route_idx = rng.randint(0, max(0, waypoints_np.shape[0] - route_margin - 1))
+            route_x, route_y = waypoints_np[route_idx]
+            candidate_pose = world.get_map().get_waypoint(carla.Location(x=float(route_x), y=float(route_y))).transform
+            lateral = rng.uniform(-args.lateral_perturb_max, args.lateral_perturb_max)
+            yaw_offset = rng.uniform(-args.yaw_perturb_max_deg, args.yaw_perturb_max_deg)
+            right = candidate_pose.get_right_vector()
+            candidate_pose.location += carla.Location(x=right.x * lateral, y=right.y * lateral, z=0.5)
+            candidate_pose.rotation.yaw += yaw_offset
+            ego_vehicle = world.try_spawn_actor(vehicle_bp, candidate_pose)
+            if ego_vehicle is not None:
+                start_pose = candidate_pose
+                print(f"Randomized spawn (attempt {attempt}): route_idx={route_idx} lateral={lateral:.2f}m "
+                      f"yaw_offset={yaw_offset:.2f}deg weather={args.weather}")
+                break
+            print(f"Randomized spawn attempt {attempt} collided at route_idx={route_idx}, resampling...")
+        if ego_vehicle is None:
+            raise RuntimeError(f"Failed to find a collision-free randomized spawn point after {max_spawn_attempts} attempts")
+    elif args.track == 'town04':
+        start_pose = spawn_points[PLAYER_START_INDEX]
+        ego_vehicle = world.spawn_actor(vehicle_bp, start_pose)
+    else:
+        # Custom OpenDRIVE tracks only expose one auto-generated spawn point (unrelated to
+        # PLAYER_START_INDEX, which is Town04-specific) -- start from the route's first
+        # waypoint instead, snapped onto the lane the same way --randomize-spawn does.
+        first_x, first_y = waypoints_np[0]
+        start_pose = world.get_map().get_waypoint(carla.Location(x=float(first_x), y=float(first_y))).transform
+        start_pose.location.z += 0.5
+        ego_vehicle = world.spawn_actor(vehicle_bp, start_pose)
     # Always on: throttle/brake are read from CARLA's autopilot every frame (see expert_control
     # below) regardless of whether steering comes from autopilot (RUN_NO==0) or the NN+CBF.
     ego_vehicle.set_autopilot(True)
-    
+    traffic_manager.vehicle_percentage_speed_difference(ego_vehicle, AUTOPILOT_SPEED_DIFF_PERCENT)
+
     spectator = world.get_spectator()
     vehicle_transform = ego_vehicle.get_transform()
     spectator.set_transform(carla.Transform(vehicle_transform.location + carla.Location(z=20), carla.Rotation(pitch=-90)))
@@ -468,22 +723,6 @@ def exec_waypoint_nav_demo(args):
     enable_live_plot = enable_live_plot == 'True'
     live_plot_period = float(demo_opt.get('live_plotting_period', 0))
     live_plot_timer = Timer(live_plot_period)
-
-    waypoints_file = WAYPOINTS_FILENAME
-    waypoints_np   = None
-    with open(waypoints_file) as waypoints_file_handle:
-        waypoints = list(csv.reader(waypoints_file_handle, 
-                                    delimiter=',',
-                                    quoting=csv.QUOTE_NONNUMERIC))
-        waypoints_np = np.array(waypoints)
-    
-    centerline_file = CENTERLINE_FILENAME
-    centerline_np   = None
-    with open(centerline_file) as waypoints_file_handle:
-        centerline = list(csv.reader(waypoints_file_handle, 
-                                    delimiter=',',
-                                    quoting=csv.QUOTE_NONNUMERIC))
-        centerline_np = np.array(centerline)
 
     wp_distance = []   # distance array
     for i in range(1, waypoints_np.shape[0]):
@@ -558,6 +797,7 @@ def exec_waypoint_nav_demo(args):
     cmd_steer = 0
     cmd_steer1 = 0
     cmd_throttle = 0
+    cmd_brake = 0
     
     # --- MODEL INITIALIZATION ---
     # Here the 4 separate models that make up the SA-TCP architecture are initialized.
@@ -605,10 +845,11 @@ def exec_waypoint_nav_demo(args):
         model_safety_3.load_state_dict(torch.load(os.path.join(model_path, load_checkpoint_name(model_path, '-safety-3'))))
         print(model)
     
-    if not os.path.exists('run'+str(RUN_NO)+'_images'):
-        os.makedirs('run'+str(RUN_NO)+'_images')
-    if not os.path.exists('run'+str(RUN_NO)+'_video'):
-        os.makedirs('run'+str(RUN_NO)+'_video')
+    tag_suffix = ('_' + args.episode_tag) if args.episode_tag else ''
+    images_dir = os.path.join(args.output_dir, 'run' + str(RUN_NO) + tag_suffix + '_images')
+    video_dir = os.path.join(args.output_dir, 'run' + str(RUN_NO) + tag_suffix + '_video')
+    makedirs_maybe_smb(images_dir)
+    makedirs_maybe_smb(video_dir)
 
     print("Running for", TOTAL_EPISODE_FRAMES)
     curvature_save = 0
@@ -627,7 +868,8 @@ def exec_waypoint_nav_demo(args):
     steer_comps = []  # [raw NN steer, CBF-applied steer] per frame, for with/without-CBF intervention analysis
     current_x, current_y, current_yaw = 0.,0.,0.
     current_timestamp = 0.
-    
+    stall_seconds = 0.  # consecutive sim-time spent under STALL_SPEED_THRESHOLD, post-startup
+
     # --- INFERENCE LOOP ---
     # This is the real-time driving loop. For every frame, the camera captures an image,
     # the 4 models process it, and the CBF acts as the safety referee before sending 
@@ -673,7 +915,17 @@ def exec_waypoint_nav_demo(args):
             continue
         else:
             current_timestamp = current_timestamp - WAIT_TIME_BEFORE_START
-        
+
+        if abs(current_speed) < STALL_SPEED_THRESHOLD:
+            stall_seconds += settings.fixed_delta_seconds
+            if stall_seconds >= STALL_TIMEOUT_SECONDS:
+                raise RuntimeError(
+                    f"Vehicle stalled (speed < {STALL_SPEED_THRESHOLD} m/s) for "
+                    f"{STALL_TIMEOUT_SECONDS}s at ({current_x:.1f}, {current_y:.1f}) -- "
+                    f"aborting episode instead of recording a parked car for the remaining runtime.")
+        else:
+            stall_seconds = 0.
+
         if frame%5 == 0 :
             expert_control = ego_vehicle.get_control()
             cmd_steer = expert_control.steer
@@ -691,13 +943,13 @@ def exec_waypoint_nav_demo(args):
             
             img_array_video = np.array(image_converter.to_rgb_array(video_image))
             im_video = Image.fromarray(img_array_video)
-            im_video.save('run'+str(RUN_NO)+'_video/frame_'+str(frame//5)+'.png')
-            
+            save_image_maybe_smb(im_video, video_dir+'/frame_'+str(frame//5)+'.png')
+
             img_array = np.array(image_converter.to_rgb_array(main_image))
             im = Image.fromarray(img_array)
             steer_to_save = int(100*cmd_steer*180./math.pi)
             if frame//5 > 0:
-                im.save('run'+str(RUN_NO)+'_images/frame_'+str(frame//5)+'_'+str(steer_to_save)+\
+                save_image_maybe_smb(im, images_dir+'/frame_'+str(frame//5)+'_'+str(steer_to_save)+\
                     '_'+str(int(10000*curvature_save))+'_'+str(int(100*x_save))+'_'+\
                     str(int(100*theta_save*180./math.pi))+'_'+str(int(100*current_speed))+\
                     '_'+str(int(100*current_speed_perp))+'.png')
@@ -926,7 +1178,8 @@ def main():
     global model_path
     global N_ITERS
     global SAFEGUARD
-    
+    global LANE_WIDTH
+
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument(
         '-v', '--verbose',
@@ -959,6 +1212,46 @@ def main():
         '--no-cbf',
         action='store_true',
         help='force the CBF safety gate off, overriding the RUN_NO < K_ITERS ramp-up default')
+    argparser.add_argument(
+        '--weather',
+        default='ClearNoon',
+        help='CARLA weather preset name from carla.WeatherParameters (default: ClearNoon)')
+    argparser.add_argument(
+        '--randomize-spawn',
+        action='store_true',
+        help='spawn at a random point along the route (instead of the fixed PLAYER_START_INDEX), '
+             'perturbed sideways/yaw per --lateral-perturb-max/--yaw-perturb-max-deg, for recovery-maneuver data collection')
+    argparser.add_argument(
+        '--lateral-perturb-max',
+        type=float,
+        default=1.5,
+        help='max meters of sideways spawn offset when --randomize-spawn is set (default: 1.5)')
+    argparser.add_argument(
+        '--yaw-perturb-max-deg',
+        type=float,
+        default=15.0,
+        help='max degrees of yaw spawn offset when --randomize-spawn is set (default: 15.0)')
+    argparser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='seed for --randomize-spawn\'s route-point and perturbation draws (default: unseeded)')
+    argparser.add_argument(
+        '--episode-tag',
+        default='',
+        help='appended to the output image/video folder names (run<N>_<tag>_images), '
+             'so repeated collection episodes with the same --run_no don\'t overwrite each other')
+    argparser.add_argument(
+        '--output-dir',
+        default='.',
+        help='root directory for the run<N>_..._images/video folders (default: current directory). '
+             'Point this at a mounted network share to collect data without using local disk.')
+    argparser.add_argument(
+        '--track',
+        default='austin_map',
+        choices=sorted(TRACKS.keys()),
+        help='which track/map to run on (default: austin_map; pass --track town04 for the '
+             'original Phase 1 baseline map)')
     args = argparser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -973,15 +1266,26 @@ def main():
     if not SAFEGUARD :
         N_ITERS = 1
     model_path = 'saved_models_iter' + str(RUN_NO-1)
-    
+    LANE_WIDTH = TRACKS[args.track]['lane_width']
+
+    # Validate up front rather than inside the retry loop below -- a typo'd preset (or missing
+    # SMB creds) would otherwise raise on every attempt and retry forever instead of failing fast.
+    if getattr(carla.WeatherParameters, args.weather, None) is None:
+        raise ValueError(f"Unknown --weather preset '{args.weather}'; see carla.WeatherParameters for valid names.")
+    if is_unc_path(args.output_dir) and not (os.environ.get('SMB_USERNAME') and os.environ.get('SMB_PASSWORD')):
+        raise RuntimeError(
+            '--output-dir is a UNC path but SMB_USERNAME/SMB_PASSWORD are not set in the environment.')
+
+    attempt = 0
     while True:
         try:
-            exec_waypoint_nav_demo(args)
+            exec_waypoint_nav_demo(args, spawn_seed_offset=attempt)
             print('Done.')
             return
 
         except Exception as error:
             logging.error(error)
+            attempt += 1
             time.sleep(1)
 
 if __name__ == '__main__':
